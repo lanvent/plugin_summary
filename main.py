@@ -1,6 +1,6 @@
 # encoding:utf-8
 
-import os
+import os,re
 from bot import bot_factory
 from bridge.bridge import Bridge
 from bridge.context import ContextType
@@ -31,7 +31,6 @@ class Summary(Plugin):
         if btype not in [const.OPEN_AI, const.CHATGPT, const.CHATGPTONAZURE]:
             raise Exception("[Summary] init failed, not supported bot type")
         self.bot = bot_factory.create_bot(Bridge().btype['chat'])
-
         self.handlers[Event.ON_HANDLE_CONTEXT] = self.on_handle_context
         self.handlers[Event.ON_RECEIVE_MESSAGE] = self.on_receive_message
         logger.info("[Summary] inited")
@@ -80,7 +79,14 @@ class Summary(Plugin):
             if conf().get('channel_type', 'wx') == 'wx' and msg.from_user_nickname is not None:
                 session_id = msg.from_user_nickname # itchat channel id会变动，只好用名字作为session id
             records = self._get_records(session_id, 0)
-            if len(records) == 0:
+            for i in range(len(records)):
+                record=list(records[i])
+                content = record[3]
+                clist = re.split(r'\n- - - - - - - - -.*?\n', content)
+                if len(clist) > 1:
+                    record[3] = clist[1]
+                    records[i] = tuple(record)
+            if len(records) <= 1:
                 reply = Reply(ReplyType.INFO, "当前无聊天记录")
                 e_context['reply'] = reply
                 e_context.action = EventAction.BREAK_PASS
@@ -95,22 +101,22 @@ class Summary(Plugin):
                     username = record[2]
                     content = record[3]
                     if record[4] in [str(ContextType.IMAGE),str(ContextType.VOICE)]:
-                        content = f"<{record[4]}>"    
+                        content = f"[{record[4]}]"    
                     query += f'"{username}"' + ": " + content + "\n\n"
-                prompt = "你是一位群聊机器人，你需要对给出的聊天记录进行摘要，要求简明扼要，以包含列表的大纲形式输出，同时请用emoji表示说话人的情绪。在聊天记录中<IMAGE>和<VOICE>分别表示图片和语音。\"B:「A：xxx」\n- - - - - - - - - - - - - - -\nyyy\"表示\"B\"对\"A\"的发言发表了评论。"
+                prompt = "你是一位群聊机器人，你需要对给出的聊天记录进行摘要，要求简明扼要，以包含列表的大纲形式输出，如果识别到说话人情绪请使用emoji表情表示。\n在聊天记录中，[xxx]表示对图片或声音文件的说明。\n"
                 if e_context['context']['isgroup']:
                     prefixs = conf().get('group_chat_prefix',[''])
                 else:
                     prefixs = conf().get('single_chat_prefix',[''])
                 if len(prefixs) > 0:
-                    prompt += "{"+",".join([f'"{prefix}"' for prefix in prefixs])+"}" + "中的词语是在聊天中触发你回复的前缀。"
+                    prompt += "{"+",".join([f'"{prefix}"' for prefix in prefixs])+"}" + "里的词语是在聊天中触发你回复的前缀，你的回复不会包含在聊天记录中。\n"
                 plugin_trigger_prefix = conf().get('plugin_trigger_prefix', "$")
-                prompt += f"在触发你回答后，剩下的内容如果以{plugin_trigger_prefix}开始，表示需要触发额外安装的某个功能插件。"
+                prompt += f"在触发你回复后，剩下的内容如果以{plugin_trigger_prefix}开始，表示需要触发额外安装的插件功能（你无法感知到）。\n"
                 session = sessions.build_session(session_id, prompt)
 
-                session.add_query("需要你总结的内容如下 ：\n%s"%query)
+                session.add_query("现在需要你总结如下聊天记录：\n\n%s"%query)
                 if  session.calc_tokens() > max_tokens:
-                    logger.debug("[Summary] summary failed, tokens: %d" % session.calc_tokens())
+                    # logger.debug("[Summary] summary failed, tokens: %d" % session.calc_tokens())
                     return None
                 return session
 
@@ -129,7 +135,7 @@ class Summary(Plugin):
                 logger.debug("[Summary] summary %d messages" % (right))
             else:
                 logger.debug("[Summary] summary all %d messages" % (len(records)))
-            logger.debug("[Summary] session query: %s" % session.messages)
+            logger.debug("[Summary] session query: %s, prompt_tokens: %d" % (session.messages, session.calc_tokens()))
             result = self.bot.reply_text(session)
             total_tokens, completion_tokens, reply_content = result['total_tokens'], result['completion_tokens'], result['content']
             logger.debug("[Summary] total_tokens: %d, completion_tokens: %d, reply_content: %s" % (total_tokens, completion_tokens, reply_content))
