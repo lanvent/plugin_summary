@@ -5,6 +5,7 @@ from bot import bot_factory
 from bridge.bridge import Bridge
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
+from channel.chat_channel import check_contain, check_prefix
 from channel.chat_message import ChatMessage
 from config import conf
 import plugins
@@ -23,8 +24,21 @@ class Summary(Plugin):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         c = self.conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS chat_records
-                    (sessionid TEXT, msgid INTEGER, user TEXT, content TEXT, type TEXT, timestamp INTEGER,
+                    (sessionid TEXT, msgid INTEGER, user TEXT, content TEXT, type TEXT, timestamp INTEGER, is_triggered INTEGER,
                     PRIMARY KEY (sessionid, msgid))''')
+        
+        # 后期增加了is_triggered字段，这里做个过渡，这段代码某天会删除
+        c = c.execute("PRAGMA table_info(chat_records);")
+        column_exists = False
+        for column in c.fetchall():
+            logger.debug("[Summary] column: {}" .format(column))
+            if column[1] == 'is_triggered':
+                column_exists = True
+                break
+        if not column_exists:
+            self.conn.execute("ALTER TABLE chat_records ADD COLUMN is_triggered INTEGER DEFAULT 0;")
+            self.conn.execute("UPDATE chat_records SET is_triggered = 0;")
+
         self.conn.commit()
 
         btype = Bridge().btype['chat']
@@ -35,10 +49,10 @@ class Summary(Plugin):
         self.handlers[Event.ON_RECEIVE_MESSAGE] = self.on_receive_message
         logger.info("[Summary] inited")
 
-    def _insert_record(self, session_id, msg_id, user, content, msg_type, timestamp):
+    def _insert_record(self, session_id, msg_id, user, content, msg_type, timestamp, is_triggered = 0):
         c = self.conn.cursor()
-        logger.debug("[Summary] insert record: {} {} {} {} {} {}" .format(session_id, msg_id, user, content, msg_type, timestamp))
-        c.execute("INSERT INTO chat_records VALUES (?,?,?,?,?,?)", (session_id, msg_id, user, content, msg_type, timestamp))
+        logger.debug("[Summary] insert record: {} {} {} {} {} {} {}" .format(session_id, msg_id, user, content, msg_type, timestamp, is_triggered))
+        c.execute("INSERT OR REPLACE INTO chat_records VALUES (?,?,?,?,?,?,?)", (session_id, msg_id, user, content, msg_type, timestamp, is_triggered))
         self.conn.commit()
     
     def _get_records(self, session_id, start_date=0, limit=9999):
@@ -54,7 +68,7 @@ class Summary(Plugin):
         if conf().get('channel_type', 'wx') == 'wx' and cmsg.from_user_nickname is not None:
             session_id = cmsg.from_user_nickname # itchat channel id会变动，只好用群名作为session id
 
-        if context["isgroup"]:
+        if context.get("isgroup", False):
             username = cmsg.actual_user_nickname
             if username is None:
                 username = cmsg.actual_user_id
@@ -62,7 +76,23 @@ class Summary(Plugin):
             username = cmsg.from_user_nickname
             if username is None:
                 username = cmsg.from_user_id
-        self._insert_record(session_id, cmsg.msg_id, username, context.content, str(context.type), cmsg.create_time)
+
+        is_triggered = False
+        content = context.content
+        if context.get("isgroup", False): # 群聊
+            # 校验关键字
+            match_prefix = check_prefix(content, conf().get('group_chat_prefix'))
+            match_contain = check_contain(content, conf().get('group_chat_keyword'))
+            if match_prefix is not None or match_contain is not None:
+                is_triggered = True
+            if context['msg'].is_at and not conf().get("group_at_off", False):
+                is_triggered = True
+        else: # 单聊
+            match_prefix = check_prefix(content, conf().get('single_chat_prefix',['']))
+            if match_prefix is not None:
+                is_triggered = True
+
+        self._insert_record(session_id, cmsg.msg_id, username, context.content, str(context.type), cmsg.create_time, int(is_triggered))
         # logger.debug("[Summary] {}:{} ({})" .format(username, context.content, session_id))
 
     def on_handle_context(self, e_context: EventContext):
@@ -100,21 +130,19 @@ class Summary(Plugin):
                 for record in records[::-1]:
                     username = record[2]
                     content = record[3]
+                    is_triggered = record[6]
                     if record[4] in [str(ContextType.IMAGE),str(ContextType.VOICE)]:
-                        content = f"[{record[4]}]"    
-                    query += f'"{username}"' + ": " + content + "\n\n"
-                prompt = "你是一位群聊机器人，你需要对给出的聊天记录进行摘要，要求简明扼要，以包含列表的大纲形式输出，如果识别到说话人情绪请使用emoji表情表示。\n在聊天记录中，[xxx]表示对图片或声音文件的说明。\n"
-                if e_context['context']['isgroup']:
-                    prefixs = conf().get('group_chat_prefix',[''])
-                else:
-                    prefixs = conf().get('single_chat_prefix',[''])
-                if len(prefixs) > 0:
-                    prompt += "{"+",".join([f'"{prefix}"' for prefix in prefixs])+"}" + "里的词语是在聊天中触发你回复的前缀，你的回复不会包含在聊天记录中。\n"
-                plugin_trigger_prefix = conf().get('plugin_trigger_prefix', "$")
-                prompt += f"在触发你回复后，剩下的内容如果以{plugin_trigger_prefix}开始，表示需要触发额外安装的插件功能（你无法感知到）。\n"
+                        content = f"[{record[4]}]"
+                    
+                    sentence = ""
+                    if is_triggered:
+                        sentence += "(T)"
+                    sentence += f'<{username}>' + ": \"" + content + "\""
+                    query += "\n\n"+sentence
+                prompt = "你是一位群聊机器人，你需要对给出的聊天记录进行摘要，要求简明扼要，以包含列表的大纲形式输出，如果识别到说话人情绪请使用emoji表情表示。\n在聊天记录中，[]中是对图片或声音文件的说明，<>:""内分别是说话人和讲话内容。人名前的(T)表示这条信息触发了群聊机器人回复，请注意聊天记录中不包含你自己的回复。\n"
                 session = sessions.build_session(session_id, prompt)
 
-                session.add_query("现在需要你总结如下聊天记录：\n\n%s"%query)
+                session.add_query("需要你总结的聊天记录如下：%s"%query)
                 if  session.calc_tokens() > max_tokens:
                     # logger.debug("[Summary] summary failed, tokens: %d" % session.calc_tokens())
                     return None
