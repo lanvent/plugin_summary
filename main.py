@@ -14,7 +14,7 @@ from common.log import logger
 from common import const
 import sqlite3
 
-@plugins.register(name="Summary", desire_priority=-1, desc="A simple plugin to summary messages", version="0.1", author="lanvent")
+@plugins.register(name="Summary", desire_priority=-1, desc="A simple plugin to summary messages", version="0.2", author="lanvent")
 class Summary(Plugin):
     def __init__(self):
         super().__init__()
@@ -95,6 +95,72 @@ class Summary(Plugin):
         self._insert_record(session_id, cmsg.msg_id, username, context.content, str(context.type), cmsg.create_time, int(is_triggered))
         # logger.debug("[Summary] {}:{} ({})" .format(username, context.content, session_id))
 
+    def _check_tokens(self, records, max_tokens=3600):
+        query = ""
+        for record in records[::-1]:
+            username = record[2]
+            content = record[3]
+            is_triggered = record[6]
+            if record[4] in [str(ContextType.IMAGE),str(ContextType.VOICE)]:
+                content = f"[{record[4]}]"
+            
+            sentence = ""
+            if is_triggered:
+                sentence += "T "
+            sentence += f'{username}' + ": \"" + content + "\""
+            query += "\n\n"+sentence
+        prompt = "你是一位群聊机器人，需要对聊天记录进行简明扼要的摘要总结，用列表的形式输出，尽量包含说话人名字。\n聊天记录格式：[x]是emoji表情或者是对图片和声音文件的说明，某些消息前的T字母表示消息触发了群聊机器人的回复，内容大多是提问，若带有特殊符号如#和$一般是触发你无法感知的某个插件功能，聊天记录中不包含你对这类消息的回复，这类消息可以降低权重。请不要在回复中包含聊天记录格式中出现的符号。\n"
+        
+        firstmsg_id = records[0][1]
+        session = self.bot.sessions.build_session(firstmsg_id, prompt)
+
+        session.add_query("需要你总结的聊天记录如下：%s"%query)
+        if  session.calc_tokens() > max_tokens:
+            # logger.debug("[Summary] summary failed, tokens: %d" % session.calc_tokens())
+            return None
+        return session
+
+    def _split_messages_to_summarys(self, records, max_tokens_persession=3600 , max_summarys=6):
+        summarys = []
+        count = 0
+        while len(records) > 0 and len(summarys) < max_summarys:
+            session = self._check_tokens(records,max_tokens_persession)
+            last = 0
+            if session is None:
+                left,right = 0, len(records)
+                while left < right:
+                    mid = (left + right) // 2
+                    logger.debug("[Summary] left: %d, right: %d, mid: %d" % (left, right, mid))
+                    session = self._check_tokens(records[:mid], max_tokens_persession)
+                    if session is None:
+                        right = mid - 1
+                    else:
+                        left = mid + 1
+                session = self._check_tokens(records[:left-1], max_tokens_persession)
+                last = left
+                logger.debug("[Summary] summary %d messages" % (left))
+            else:
+                last = len(records)
+                logger.debug("[Summary] summary all %d messages" % (len(records)))
+            if session is None:
+                logger.debug("[Summary] summary failed, session is None")
+                break
+            logger.debug("[Summary] session query: %s, prompt_tokens: %d" % (session.messages, session.calc_tokens()))
+            result = self.bot.reply_text(session)
+            total_tokens, completion_tokens, reply_content = result['total_tokens'], result['completion_tokens'], result['content']
+            logger.debug("[Summary] total_tokens: %d, completion_tokens: %d, reply_content: %s" % (total_tokens, completion_tokens, reply_content))
+            if completion_tokens == 0:
+                if len(summarys) == 0:
+                    return count,reply_content
+                else:
+                    break
+            summary = reply_content
+            summarys.append(summary)
+            records = records[last:]
+            count += last
+        return count,summarys
+
+
     def on_handle_context(self, e_context: EventContext):
 
         if e_context['context'].type != ContextType.TEXT:
@@ -103,12 +169,17 @@ class Summary(Plugin):
         content = e_context['context'].content
         logger.debug("[Summary] on_handle_context. content: %s" % content)
         trigger_prefix = conf().get('plugin_trigger_prefix', "$")
-        if content == trigger_prefix+"总结":
+        clist = content.split()
+        if clist[0] == trigger_prefix+"总结":
             msg:ChatMessage = e_context['context']['msg']
             session_id = msg.from_user_id
             if conf().get('channel_type', 'wx') == 'wx' and msg.from_user_nickname is not None:
                 session_id = msg.from_user_nickname # itchat channel id会变动，只好用名字作为session id
-            records = self._get_records(session_id, 0)
+            limit = 99
+            if len(clist) > 1:
+                limit = int(clist[1])
+                logger.debug("[Summary] limit: %d" % limit)
+            records = self._get_records(session_id, 0, limit)
             for i in range(len(records)):
                 record=list(records[i])
                 content = record[3]
@@ -122,56 +193,39 @@ class Summary(Plugin):
                 e_context.action = EventAction.BREAK_PASS
                 return
             
-            max_tokens = 3600
-            sessions = self.bot.sessions
+            max_tokens_persession = 3600
 
-            def check(records):
-                query = ""
-                for record in records[::-1]:
-                    username = record[2]
-                    content = record[3]
-                    is_triggered = record[6]
-                    if record[4] in [str(ContextType.IMAGE),str(ContextType.VOICE)]:
-                        content = f"[{record[4]}]"
-                    
-                    sentence = ""
-                    if is_triggered:
-                        sentence += "(T)"
-                    sentence += f'<{username}>' + ": \"" + content + "\""
-                    query += "\n\n"+sentence
-                prompt = "你是一位群聊机器人，需要对聊天记录进行简明扼要的摘要总结，用列表的形式输出，输出可包含说话人名。\n在聊天记录中，[x]是相应emoji表情 或者是对图片和声音文件的说明，<>是说话人名字，之后会跟随讲话内容。名字前面的(T)表示这条信息触发了群聊机器人的回复，内容是提问或使用指令触发某个功能，聊天记录中不包含你对这类消息的回复。\n"
-                session = sessions.build_session(session_id, prompt)
+            count, summarys = self._split_messages_to_summarys(records, max_tokens_persession)
+            if count == 0 :
+                if isinstance(summarys,str):
+                    reply = Reply(ReplyType.ERROR, summarys)
+                else:
+                    reply = Reply(ReplyType.ERROR, "总结聊天记录失败")
+                e_context['reply'] = reply
+                e_context.action = EventAction.BREAK_PASS
+                return
 
-                session.add_query("需要你总结的聊天记录如下：%s"%query)
-                if  session.calc_tokens() > max_tokens:
-                    # logger.debug("[Summary] summary failed, tokens: %d" % session.calc_tokens())
-                    return None
-                return session
 
-            session = check(records)
-            if session is None:
-                left,right = 0, len(records)
-                while left < right:
-                    mid = (left + right) // 2
-                    logger.debug("[Summary] left: %d, right: %d, mid: %d" % (left, right, mid))
-                    session = check(records[:mid])
-                    if session is None:
-                        right = mid - 1
-                    else:
-                        left = mid + 1
-                session = check(records[:left-1])
-                logger.debug("[Summary] summary %d messages" % (left))
-            else:
-                logger.debug("[Summary] summary all %d messages" % (len(records)))
-            logger.debug("[Summary] session query: %s, prompt_tokens: %d" % (session.messages, session.calc_tokens()))
+            if len(summarys) == 1:
+                reply = Reply(ReplyType.TEXT, f"本次总结了{count}条消息。\n\n"+summarys[0])
+                e_context['reply'] = reply
+                e_context.action = EventAction.BREAK_PASS
+                return
+            
+            query = ""
+            for i,summary in enumerate(reversed(summarys)):
+                query += f"第{i}段摘要内容:\n"+summary + "\n----------------\n\n"
+            prompt = "你是一位群聊机器人，聊天记录已经在你的大脑中被你总结成多段摘要总结，你需要对它们进行摘要总结，最后输出一篇完整的摘要总结，用列表的形式输出，在回复中务必不要体现原始输入是多段摘要总结。\n"
+            
+            session = self.bot.sessions.build_session(session_id, prompt)
+            session.add_query("需要你总结的多段摘要内容如下：\n%s"%query)
             result = self.bot.reply_text(session)
             total_tokens, completion_tokens, reply_content = result['total_tokens'], result['completion_tokens'], result['content']
             logger.debug("[Summary] total_tokens: %d, completion_tokens: %d, reply_content: %s" % (total_tokens, completion_tokens, reply_content))
             if completion_tokens == 0:
-                reply = Reply(ReplyType.ERROR, reply_content)
+                reply = Reply(ReplyType.ERROR, "合并摘要失败，"+reply_content+"\n原始多段摘要如下：\n"+query)
             else:
-                reply = Reply(ReplyType.TEXT, reply_content)
-                
+                reply = Reply(ReplyType.TEXT, f"本次总结了{count}条消息(分段总结方式)。\n\n"+reply_content)     
             e_context['reply'] = reply
             e_context.action = EventAction.BREAK_PASS # 事件结束，并跳过处理context的默认逻辑
 
@@ -181,5 +235,5 @@ class Summary(Plugin):
         if not verbose:
             return help_text
         trigger_prefix = conf().get('plugin_trigger_prefix', "$")
-        help_text += f"使用方法:输入{trigger_prefix}总结，我会帮助你总结聊天记录。\n"
+        help_text += f"使用方法:输入\"{trigger_prefix}总结 最近消息数量\"，我会帮助你总结聊天记录。\n例如：\"{trigger_prefix}总结 100\"，我会帮你总结最近100条消息。\n"
         return help_text
