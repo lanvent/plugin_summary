@@ -131,8 +131,8 @@ class Summary(Plugin):
                         right = mid - 1
                     else:
                         left = mid + 1
-                session = check(records[:right])
-                logger.debug("[Summary] summary %d messages" % (right))
+                session = check(records[:left-1])
+                logger.debug("[Summary] summary %d messages" % (left))
             else:
                 logger.debug("[Summary] summary all %d messages" % (len(records)))
             logger.debug("[Summary] session query: %s, prompt_tokens: %d" % (session.messages, session.calc_tokens()))
