@@ -105,11 +105,11 @@ class Summary(Plugin):
                 content = f"[{record[4]}]"
             
             sentence = ""
-            if is_triggered:
-                sentence += "T "
             sentence += f'{username}' + ": \"" + content + "\""
+            if is_triggered:
+                sentence += " <T>"
             query += "\n\n"+sentence
-        prompt = "你是一位群聊机器人，需要对聊天记录进行简明扼要的摘要总结，用列表的形式输出，尽量包含说话人名字。\n聊天记录格式：[x]是emoji表情或者是对图片和声音文件的说明，某些消息前的T字母表示消息触发了群聊机器人的回复，内容大多是提问，若带有特殊符号如#和$一般是触发你无法感知的某个插件功能，聊天记录中不包含你对这类消息的回复，这类消息可以降低权重。请不要在回复中包含聊天记录格式中出现的符号。\n"
+        prompt = "你是一位群聊机器人，需要对聊天记录进行简明扼要的摘要总结，用列表的形式输出，尽量包含说话人名字。\n聊天记录格式：[x]是emoji表情或者是对图片和声音文件的说明，消息最后出现<T>表示消息触发了群聊机器人的回复，内容通常是提问，若带有特殊符号如#和$则是触发你无法感知的某个插件功能，聊天记录中不包含你对这类消息的回复，可降低这些消息的权重。请不要在回复中包含聊天记录格式中出现的符号。\n"
         
         firstmsg_id = records[0][1]
         session = self.bot.sessions.build_session(firstmsg_id, prompt)
@@ -123,6 +123,7 @@ class Summary(Plugin):
     def _split_messages_to_summarys(self, records, max_tokens_persession=3600 , max_summarys=6):
         summarys = []
         count = 0
+        self.bot.args["max_tokens"] = 400
         while len(records) > 0 and len(summarys) < max_summarys:
             session = self._check_tokens(records,max_tokens_persession)
             last = 0
@@ -212,13 +213,14 @@ class Summary(Plugin):
                 e_context.action = EventAction.BREAK_PASS
                 return
             
+            self.bot.args["max_tokens"] = None
             query = ""
             for i,summary in enumerate(reversed(summarys)):
-                query += f"第{i}段摘要内容:\n"+summary + "\n----------------\n\n"
-            prompt = "你是一位群聊机器人，聊天记录已经在你的大脑中被你总结成多段摘要总结，你需要对它们进行摘要总结，最后输出一篇完整的摘要总结，用列表的形式输出，在回复中务必不要体现原始输入是多段摘要总结。\n"
+                query += summary + "\n----------------\n\n"
+            prompt = "你是一位群聊机器人，聊天记录已经在你的大脑中被你总结成多段摘要总结，你需要对它们进行摘要总结，最后输出一篇完整的摘要总结，用列表的形式输出。\n"
             
             session = self.bot.sessions.build_session(session_id, prompt)
-            session.add_query("需要你总结的多段摘要内容如下：\n%s"%query)
+            session.add_query(query)
             result = self.bot.reply_text(session)
             total_tokens, completion_tokens, reply_content = result['total_tokens'], result['completion_tokens'], result['content']
             logger.debug("[Summary] total_tokens: %d, completion_tokens: %d, reply_content: %s" % (total_tokens, completion_tokens, reply_content))
