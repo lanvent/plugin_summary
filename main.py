@@ -1,6 +1,8 @@
 # encoding:utf-8
 
+import json
 import os,re
+import time
 from bot import bot_factory
 from bridge.bridge import Bridge
 from bridge.context import ContextType
@@ -13,8 +15,42 @@ from plugins import *
 from common.log import logger
 from common import const
 import sqlite3
+from chatgpt_tool_hub.chains.llm import LLMChain
+from chatgpt_tool_hub.models import build_model_params
+from chatgpt_tool_hub.models.model_factory import ModelFactory
+from chatgpt_tool_hub.prompts import PromptTemplate
+TRANSLATE_PROMPT = '''
+You are now the following python function: 
+```# {{translate text to commands}}"
+        def translate_text(text: str) -> str:
+```
+Only respond with your `return` value, Don't reply anything else.
 
-@plugins.register(name="Summary", desire_priority=-1, desc="A simple plugin to summary messages", version="0.2", author="lanvent")
+Commands:
+{{Summary chat logs}}: "summary", args: {{("duration_in_seconds"): <integer>, ("count"): <integer>}}
+{{Do Nothing}}:"do_nothing",  args:  {{}}
+
+argument in brackets means optional argument.
+
+You should only respond in JSON format as described below.
+Response Format: 
+{{
+    "name": "command name", 
+    "args": {{"arg name": "value"}}
+}}
+Ensure the response can be parsed by Python json.loads.
+
+Input: {input}
+'''
+def find_json(json_string):
+    json_pattern = re.compile(r"\{[\s\S]*\}")
+    json_match = json_pattern.search(json_string)
+    if json_match:
+        json_string = json_match.group(0)
+    else:
+        json_string = ""
+    return json_string
+@plugins.register(name="summary", desire_priority=-1, desc="A simple plugin to summary messages", version="0.3", author="lanvent")
 class Summary(Plugin):
     def __init__(self):
         super().__init__()
@@ -55,9 +91,9 @@ class Summary(Plugin):
         c.execute("INSERT OR REPLACE INTO chat_records VALUES (?,?,?,?,?,?,?)", (session_id, msg_id, user, content, msg_type, timestamp, is_triggered))
         self.conn.commit()
     
-    def _get_records(self, session_id, start_date=0, limit=9999):
+    def _get_records(self, session_id, start_timestamp=0, limit=9999):
         c = self.conn.cursor()
-        c.execute("SELECT * FROM chat_records WHERE sessionid=? and timestamp>? ORDER BY timestamp DESC LIMIT ?", (session_id, start_date, limit))
+        c.execute("SELECT * FROM chat_records WHERE sessionid=? and timestamp>? ORDER BY timestamp DESC LIMIT ?", (session_id, start_timestamp, limit))
         return c.fetchall()
 
     def on_receive_message(self, e_context: EventContext):
@@ -95,6 +131,20 @@ class Summary(Plugin):
         self._insert_record(session_id, cmsg.msg_id, username, context.content, str(context.type), cmsg.create_time, int(is_triggered))
         # logger.debug("[Summary] {}:{} ({})" .format(username, context.content, session_id))
 
+    def _translate_text_to_commands(self, text):
+        llm = ModelFactory().create_llm_model(**build_model_params({
+            "openai_api_key": conf().get("open_ai_api_key", ""),
+            "proxy": conf().get("proxy", ""),
+        }))
+
+        prompt = PromptTemplate(
+            input_variables=["input"],
+            template=TRANSLATE_PROMPT,
+        )
+        bot = LLMChain(llm=llm, prompt=prompt)
+        content = bot.run(text)
+        return content
+
     def _check_tokens(self, records, max_tokens=3600):
         query = ""
         for record in records[::-1]:
@@ -109,7 +159,7 @@ class Summary(Plugin):
             if is_triggered:
                 sentence += " <T>"
             query += "\n\n"+sentence
-        prompt = "你是一位群聊机器人，需要对聊天记录进行简明扼要的摘要总结，用列表的形式输出，尽量包含说话人名字。\n聊天记录格式：[x]是emoji表情或者是对图片和声音文件的说明，消息最后出现<T>表示消息触发了群聊机器人的回复，内容通常是提问，若带有特殊符号如#和$则是触发你无法感知的某个插件功能，聊天记录中不包含你对这类消息的回复，可降低这些消息的权重。请不要在回复中包含聊天记录格式中出现的符号。\n"
+        prompt = "你是一位群聊机器人，需要对聊天记录进行简明扼要的总结，用列表的形式输出。\n聊天记录格式：[x]是emoji表情或者是对图片和声音文件的说明，消息最后出现<T>表示消息触发了群聊机器人的回复，内容通常是提问，若带有特殊符号如#和$则是触发你无法感知的某个插件功能，聊天记录中不包含你对这类消息的回复，可降低这些消息的权重。请不要在回复中包含聊天记录格式中出现的符号。\n"
         
         firstmsg_id = records[0][1]
         session = self.bot.sessions.build_session(firstmsg_id, prompt)
@@ -120,7 +170,7 @@ class Summary(Plugin):
             return None
         return session
 
-    def _split_messages_to_summarys(self, records, max_tokens_persession=3600 , max_summarys=6):
+    def _split_messages_to_summarys(self, records, max_tokens_persession=3600 , max_summarys=8):
         summarys = []
         count = 0
         self.bot.args["max_tokens"] = 400
@@ -171,16 +221,42 @@ class Summary(Plugin):
         logger.debug("[Summary] on_handle_context. content: %s" % content)
         trigger_prefix = conf().get('plugin_trigger_prefix', "$")
         clist = content.split()
-        if clist[0] == trigger_prefix+"总结":
+        if clist[0].startswith(trigger_prefix):
+            limit = 99
+            duration = -1
+            if clist[0] == trigger_prefix+"总结":
+                if len(clist) > 1:
+                    limit = int(clist[1])
+                    logger.debug("[Summary] limit: %d" % limit)
+            elif "总结" in clist[0]:
+                text = content.split(trigger_prefix,maxsplit=1)[1]
+                try:
+                    command_json = find_json(self._translate_text_to_commands(text))
+                    command = json.loads(command_json)
+                    name = command["name"]
+                    if name.lower() == "summary":
+                        limit = int(command["args"].get("count", 99))
+                        if limit < 0:
+                            limit = 299
+                        duration = int(command["args"].get("duration_in_seconds", -1))
+                        logger.debug("[Summary] limit: %d, duration: %d seconds" % (limit, duration))
+                except Exception as e:
+                    logger.error("[Summary] translate failed: %s" % e)
+                    return
+            
+            start_time = int(time.time())
+            if duration > 0:
+                start_time = start_time - duration
+            else:
+                start_time = 0
+
+                
+
             msg:ChatMessage = e_context['context']['msg']
             session_id = msg.from_user_id
             if conf().get('channel_type', 'wx') == 'wx' and msg.from_user_nickname is not None:
                 session_id = msg.from_user_nickname # itchat channel id会变动，只好用名字作为session id
-            limit = 99
-            if len(clist) > 1:
-                limit = int(clist[1])
-                logger.debug("[Summary] limit: %d" % limit)
-            records = self._get_records(session_id, 0, limit)
+            records = self._get_records(session_id, start_time, limit)
             for i in range(len(records)):
                 record=list(records[i])
                 content = record[3]
@@ -189,7 +265,7 @@ class Summary(Plugin):
                     record[3] = clist[1]
                     records[i] = tuple(record)
             if len(records) <= 1:
-                reply = Reply(ReplyType.INFO, "当前无聊天记录")
+                reply = Reply(ReplyType.INFO, "无聊天记录可供总结")
                 e_context['reply'] = reply
                 e_context.action = EventAction.BREAK_PASS
                 return
@@ -227,7 +303,7 @@ class Summary(Plugin):
             if completion_tokens == 0:
                 reply = Reply(ReplyType.ERROR, "合并摘要失败，"+reply_content+"\n原始多段摘要如下：\n"+query)
             else:
-                reply = Reply(ReplyType.TEXT, f"本次总结了{count}条消息(分段总结方式)。\n\n"+reply_content)     
+                reply = Reply(ReplyType.TEXT, f"本次总结了{count}条消息。\n\n"+reply_content)     
             e_context['reply'] = reply
             e_context.action = EventAction.BREAK_PASS # 事件结束，并跳过处理context的默认逻辑
 
@@ -237,5 +313,5 @@ class Summary(Plugin):
         if not verbose:
             return help_text
         trigger_prefix = conf().get('plugin_trigger_prefix', "$")
-        help_text += f"使用方法:输入\"{trigger_prefix}总结 最近消息数量\"，我会帮助你总结聊天记录。\n例如：\"{trigger_prefix}总结 100\"，我会帮你总结最近100条消息。\n"
+        help_text += f"使用方法:输入\"{trigger_prefix}总结 最近消息数量\"，我会帮助你总结聊天记录。\n例如：\"{trigger_prefix}总结 100\"，我会总结最近100条消息。\n\n你也可以直接输入\"{trigger_prefix}总结前99条信息\"或\"{trigger_prefix}总结3小时内的最近10条消息\"\n我会尽可能理解你的指令。"
         return help_text
