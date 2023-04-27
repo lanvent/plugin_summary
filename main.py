@@ -50,7 +50,7 @@ def find_json(json_string):
     else:
         json_string = ""
     return json_string
-@plugins.register(name="summary", desire_priority=-1, desc="A simple plugin to summary messages", version="0.3", author="lanvent")
+@plugins.register(name="summary", desire_priority=-1, desc="A simple plugin to summary messages", version="0.3.1", author="lanvent")
 class Summary(Plugin):
     def __init__(self):
         super().__init__()
@@ -243,7 +243,9 @@ class Summary(Plugin):
                 except Exception as e:
                     logger.error("[Summary] translate failed: %s" % e)
                     return
-            
+            else:
+                return
+
             start_time = int(time.time())
             if duration > 0:
                 start_time = start_time - duration
