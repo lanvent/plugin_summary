@@ -50,7 +50,7 @@ def find_json(json_string):
     else:
         json_string = ""
     return json_string
-@plugins.register(name="summary", desire_priority=-1, desc="A simple plugin to summary messages", version="0.3.1", author="lanvent")
+@plugins.register(name="summary", desire_priority=-1, desc="A simple plugin to summary messages", version="0.3.2", author="lanvent")
 class Summary(Plugin):
     def __init__(self):
         super().__init__()
@@ -224,25 +224,32 @@ class Summary(Plugin):
         if clist[0].startswith(trigger_prefix):
             limit = 99
             duration = -1
-            if clist[0] == trigger_prefix+"总结":
-                if len(clist) > 1:
-                    limit = int(clist[1])
-                    logger.debug("[Summary] limit: %d" % limit)
-            elif "总结" in clist[0]:
-                text = content.split(trigger_prefix,maxsplit=1)[1]
-                try:
-                    command_json = find_json(self._translate_text_to_commands(text))
-                    command = json.loads(command_json)
-                    name = command["name"]
-                    if name.lower() == "summary":
-                        limit = int(command["args"].get("count", 99))
-                        if limit < 0:
-                            limit = 299
-                        duration = int(command["args"].get("duration_in_seconds", -1))
-                        logger.debug("[Summary] limit: %d, duration: %d seconds" % (limit, duration))
-                except Exception as e:
-                    logger.error("[Summary] translate failed: %s" % e)
-                    return
+
+            if "总结" in clist[0]:
+                flag = False
+                if clist[0] == trigger_prefix+"总结":
+                    flag = True
+                    if len(clist) > 1:
+                        try:
+                            limit = int(clist[1])
+                            logger.debug("[Summary] limit: %d" % limit)
+                        except Exception as e:
+                            flag = False
+                if not flag:
+                    text = content.split(trigger_prefix,maxsplit=1)[1]
+                    try:
+                        command_json = find_json(self._translate_text_to_commands(text))
+                        command = json.loads(command_json)
+                        name = command["name"]
+                        if name.lower() == "summary":
+                            limit = int(command["args"].get("count", 99))
+                            if limit < 0:
+                                limit = 299
+                            duration = int(command["args"].get("duration_in_seconds", -1))
+                            logger.debug("[Summary] limit: %d, duration: %d seconds" % (limit, duration))
+                    except Exception as e:
+                        logger.error("[Summary] translate failed: %s" % e)
+                        return
             else:
                 return
 
