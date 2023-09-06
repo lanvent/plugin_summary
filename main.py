@@ -78,7 +78,7 @@ class Summary(Plugin):
         self.conn.commit()
 
         btype = Bridge().btype['chat']
-        if btype not in [const.OPEN_AI, const.CHATGPT, const.CHATGPTONAZURE]:
+        if btype not in [const.OPEN_AI, const.CHATGPT, const.CHATGPTONAZURE, const.LINKAI]:
             raise Exception("[Summary] init failed, not supported bot type")
         self.bot = bot_factory.create_bot(Bridge().btype['chat'])
         self.handlers[Event.ON_HANDLE_CONTEXT] = self.on_handle_context
